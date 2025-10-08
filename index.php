@@ -266,10 +266,14 @@ if (php_sapi_name() === 'cli') {
         // Telegram senden (falls konfiguriert)
         $sent = 0;
         foreach ($tgEvents as $ev) {
-            if (tgSend(formatTgMessage($ev, $cliAdults))) $sent++;
+            if (!cfg('TELEGRAM_ENABLED', false)) continue;
+            $msg    = formatTgMessage($ev, $cliAdults);
+            $silent = tgShouldBeSilent($ev, $cliAdults);
+            if (tgSend($msg, $silent)) $sent++;
             usleep(200000); // 0.2s small delay
         }
         if ($sent>0) logStatus("Telegram: {$sent} Benachrichtigungen gesendet.");
+        ;
 
         logStatus("Fertig. Cache gespeichert: ".basename($cacheFile)." (".count($enriched)." Reisen).");
         exit(0);
@@ -952,8 +956,7 @@ function renderList(
 
 /* ---------------------------- Telegram ---------------------------- */
 
-function tgSend(string $text): bool {
-    if (!cfg('TELEGRAM_ENABLED', false)) return true;
+function tgSend(string $text, bool $silent = true): bool {
     $token = cfg('TELEGRAM_BOT_TOKEN', '');
     $chat  = cfg('TELEGRAM_CHAT_ID', '');
     if (!$token || !$chat) return false;
@@ -964,6 +967,7 @@ function tgSend(string $text): bool {
             'text'    => $text,
         // kein parse_mode -> plain text, robust bei Sonderzeichen
             'disable_web_page_preview' => true,
+            'disable_notification'     => $silent,
     ]);
 
     $ch = curl_init($url);
@@ -980,6 +984,37 @@ function tgSend(string $text): bool {
     curl_close($ch);
     return ($err === 0 && $code >= 200 && $code < 300);
 }
+
+function tgShouldBeSilent(array $ev, int $adults): bool {
+    // Default: aus config (fällt auf true zurück)
+    $defaultSilent = (bool) (cfg('TG_DEFAULT_SILENT', true));
+
+    // Schwellwert für „laut“ (<= threshold)
+    $threshold = (float) (cfg('TG_PNP_ALERT_THRESHOLD', 0));
+
+    // pnp (€/N/Person) aus dem Datensatz ziehen
+    $r   = $ev['row'] ?? [];
+    $pnp = null;
+
+    if (isset($r['amountPerNightPerAdult'])) {
+        $pnp = (float)$r['amountPerNightPerAdult'];
+    } else {
+        // Falls nicht gesetzt: aus amount/duration/adults ableiten (best effort)
+        $amount = isset($r['amount']) ? (float)$r['amount'] : null;
+        $dur    = isset($r['duration']) ? (int)$r['duration'] : null;
+        if ($amount !== null && $dur && $adults > 0) {
+            $pnp = $amount / $dur / $adults;
+        }
+    }
+
+    if ($threshold > 0 && $pnp !== null && $pnp <= $threshold) {
+        // Unter/gleich Schwellwert → laut senden (also NICHT stumm)
+        return false;
+    }
+    // Sonst Grundverhalten (stumm)
+    return $defaultSilent;
+}
+
 
 function formatTgMessage(array $ev, int $adults): string {
     $r = $ev['row'] ?? [];
