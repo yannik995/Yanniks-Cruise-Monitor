@@ -35,5 +35,8 @@ return [
     // Standard: stumm (silent). Wenn pnp (€/N/Person) <= THRESHOLD, dann NICHT stumm.
     // Beispiel: 70 => Alles <= 70 €/N/Person pingt „laut“.
     'TG_PNP_ALERT_THRESHOLD' => 0,   // 0 oder leer => immer stumm
-    'TG_DEFAULT_SILENT'      => true // Grundverhalten: stumm senden?
+    'TG_DEFAULT_SILENT'      => true, // Grundverhalten: stumm senden?
+
+    'SECRET'      => 'CHANGEMECHANGEMECHANGEMECHANGEMECHANGEME=',
+    'BASE_URL'      => 'CHANGEME/receive.php',
 ];
