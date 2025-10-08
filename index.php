@@ -11,21 +11,33 @@
  *******************************************************/
 declare(strict_types=1);
 
-const CACHE_DIR       = __DIR__ . '/cache';
-const TIMEOUT_SECONDS = 25;
-const SIZE_PER_PAGE   = 1000;
-const LIST_BASE       = 'https://aida.de/content/aida-search-and-booking/requests/search.cruise.v1.json';
-const DETAIL_BASE     = 'https://aida.de/content/aida-search-and-booking/requests/detail.content.json';
-const USER_AGENT      = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
-const CURRENCY        = '€';
+/* ======================= Konfiguration laden ======================= */
+$CFG = [];
+$cfgFile = __DIR__ . '/config.php';
+if (is_file($cfgFile)) {
+    $loaded = require $cfgFile;
+    if (is_array($loaded)) { $CFG = $loaded; }
+}
+function cfg(string $key, $default = null) {
+    global $CFG;
+    return $CFG[$key] ?? $default;
+}
 
-// Anzeige "neu" - wie viele Tage ab "added_at" das 🆕-Badge sichtbar ist
-const NEW_BADGE_DAYS  = 1;
+/* =================== Konstanten aus Konfig ableiten =================== */
+const LIST_BASE   = 'https://aida.de/content/aida-search-and-booking/requests/search.cruise.v1.json';
+const DETAIL_BASE = 'https://aida.de/content/aida-search-and-booking/requests/detail.content.json';
 
-// Telegram
-const TG_ENABLED    = false; // auf false setzen, wenn deaktivieren
-const TELEGRAM_BOT_TOKEN = '';
-const TELEGRAM_CHAT_ID   = '';
+define('CACHE_DIR',       cfg('CACHE_DIR',       __DIR__ . '/cache'));
+define('TIMEOUT_SECONDS', (int)cfg('TIMEOUT_SECONDS', 25));
+define('SIZE_PER_PAGE',   (int)cfg('SIZE_PER_PAGE',   1000));
+define('USER_AGENT',      (string)cfg('USER_AGENT',    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124 Safari/537.36'));
+define('CURRENCY',        (string)cfg('CURRENCY',      '€'));
+define('NEW_BADGE_DAYS',  (int)cfg('NEW_BADGE_DAYS',   3));
+
+if (!is_dir(CACHE_DIR)) { @mkdir(CACHE_DIR, 0775, true); }
+$cookieFile = CACHE_DIR . '/aida_cookies.txt';
+
+/* =================== Domain-Logik/Labels/Ranking =================== */
 
 // Reihenfolge: je höher, desto „besser“
 const CABIN_RANK = ['I'=>1,'M'=>2,'B'=>3,'V'=>4,'K'=>5,'D'=>6,'P'=>7,'J'=>8,'S'=>9];
@@ -36,9 +48,6 @@ const CABIN_LABELS = [
         'D'=>'Ver. Deluxe','P'=>'Ver. Patio.','J'=>'J.Suite','S'=>'Suite'
 ];
 const TARIFF_KEYS  = ['lig','cla','claAl','ind','indAl','comAl','pau','pauAl','see','seeAl'];
-
-if (!is_dir(CACHE_DIR)) { @mkdir(CACHE_DIR, 0775, true); }
-$cookieFile = CACHE_DIR . '/aida_cookies.txt';
 
 /* ----------------------------- CLI MODE ----------------------------- */
 if (php_sapi_name() === 'cli') {
@@ -944,9 +953,9 @@ function renderList(
 /* ---------------------------- Telegram ---------------------------- */
 
 function tgSend(string $text): bool {
-    if (!TG_ENABLED) return true;
-    $token = getenv('TELEGRAM_BOT_TOKEN') ?: TELEGRAM_BOT_TOKEN;
-    $chat  = getenv('TELEGRAM_CHAT_ID')   ?: TELEGRAM_CHAT_ID;
+    if (!cfg('TELEGRAM_ENABLED', false)) return true;
+    $token = cfg('TELEGRAM_BOT_TOKEN', '');
+    $chat  = cfg('TELEGRAM_CHAT_ID', '');
     if (!$token || !$chat) return false;
 
     $url = "https://api.telegram.org/bot{$token}/sendMessage";
@@ -969,11 +978,7 @@ function tgSend(string $text): bool {
     $err  = curl_errno($ch);
     $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
     curl_close($ch);
-    if ($err !== 0 || $code < 200 || $code >= 300) {
-        // optional: loggen
-        return false;
-    }
-    return true;
+    return ($err === 0 && $code >= 200 && $code < 300);
 }
 
 function formatTgMessage(array $ev, int $adults): string {
