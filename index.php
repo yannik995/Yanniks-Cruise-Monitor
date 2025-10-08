@@ -1,13 +1,14 @@
 <?php
 /*******************************************************
- * Yanniks CruiseMonitor
+ * Yanniks CruiseMonitor – mit Kabinen-Historie & Telegram
  * WEB:
- *   - Anzeige + Filter (adults/ship/from/to, min/max Tage, Mindest-Kabine)
+ *   - Anzeige + Filter (adults/ship/from/to, min/max Tage, Mindest-Kabine, max €/Nacht/Person, "nur neue")
+ *   - Historien-Graph (SVG) pro Reise, Linien je Kabinentyp
  * CLI:
- *   - php yanniks-cruisemonitor.php --update --adults=1 [--verbose]
- *   - Lädt Liste (size=1000) + Kabinen-Details pro Reise (nur bei neu/Preisänderung in List-API oder 1x täglich)
- *   - Status-Logs: Reise, Kabinen, Preise, günstigste Option
- *   - Telegram-Notify: neue Reisen & Preissenkungen
+ *   - php index.php --update --adults=1 [--verbose]
+ *   - Lädt Liste (size=1000) + Kabinen-Details pro Reise (bei neu/Preisänderung oder 1x täglich)
+ *   - Schreibt Preis-Historie pro Kabinentyp
+ *   - Telegram: neue Reisen & Preissenkungen (mit Kabinentypen alt/neu)
  *******************************************************/
 declare(strict_types=1);
 
@@ -38,7 +39,6 @@ if (!is_dir(CACHE_DIR)) { @mkdir(CACHE_DIR, 0775, true); }
 $cookieFile = CACHE_DIR . '/aida_cookies.txt';
 
 /* =================== Domain-Logik/Labels/Ranking =================== */
-
 // Reihenfolge: je höher, desto „besser“
 const CABIN_RANK = ['I'=>1,'M'=>2,'B'=>3,'V'=>4,'K'=>5,'D'=>6,'P'=>7,'J'=>8,'S'=>9];
 function cabinRank(string $code): int { return CABIN_RANK[$code] ?? 0; }
@@ -64,17 +64,19 @@ if (php_sapi_name() === 'cli') {
 
     $cacheFile     = CACHE_DIR . "/aida_adults{$cliAdults}.json";
     $prevCacheFile = CACHE_DIR . "/aida_adults{$cliAdults}_prev.json";
+    $histFile      = CACHE_DIR . "/aida_adults{$cliAdults}_history.json"; // Preisverlauf pro JID/Kabinentyp
 
     try {
         logStatus("Starte Update (adults={$cliAdults}) …");
 
-        // Alt-Cache laden (enriched)
+        // Alt-Cache & Historie laden
         $oldItems = [];
         if (is_file($cacheFile)) {
             [$oldItems, ] = loadCache($cacheFile);
             if (!is_array($oldItems)) $oldItems = [];
         }
         $oldMapByJid = mapByJourney($oldItems);
+        $history = loadHistory($histFile); // ['jid'=>['cabins'=>['I'=>[['ts'=>..,'pnp'=>..,'amount'=>..],..], ... ] ]]
 
         // Live-Liste holen
         warmUpAida($cookieFile);
@@ -120,19 +122,17 @@ if (php_sapi_name() === 'cli') {
             }
         }
 
-        logStatus("Reisen gesamt: {$total}. Details nötig für: ".count($needDetail).", Reuse: ".count($reuseOnly));
+        logStatus("Reisen gesamt: {$total}. Details nötig: ".count($needDetail).", Reuse: ".count($reuseOnly));
 
         // Enrichment
         $enrichedMap = []; // jid => enriched row
-
         foreach ($reuseOnly as $jid) {
             $enrichedMap[$jid] = $oldMapByJid[$jid];
-            // listAmount updaten
             $enrichedMap[$jid]['listAmount'] = $newListAmtByJid[$jid] ?? ($enrichedMap[$jid]['listAmount'] ?? null);
         }
 
         // Telegram-Events sammeln
-        $tgEvents = []; // ['type'=>'new'|'drop', 'row'=>[], 'delta'=>float, 'old'=>float]
+        $tgEvents = []; // ['type'=>'new'|'drop', 'row'=>[], 'delta'=>float, 'old'=>float, 'oldType'=>?, 'newType'=>?]
 
         // Detail-Calls für geänderte/neue
         $i = 0; $n = count($needDetail);
@@ -148,7 +148,7 @@ if (php_sapi_name() === 'cli') {
 
                 $detail = fetchCabinDetail($jid, $cliAdults, $cookieFile);
                 if (!$detail) {
-                    logStatus("  ! Keine Detail-Daten (API blockiert/leer). Reuse alter Details falls vorhanden.");
+                    logStatus("  ! Keine Detail-Daten. Reuse alter Details falls vorhanden.");
                     if (isset($oldMapByJid[$jid])) {
                         $enriched = mergeMeta($oldMapByJid[$jid], $oldMapByJid[$jid], $row);
                     } else {
@@ -160,26 +160,13 @@ if (php_sapi_name() === 'cli') {
                 } else {
                     [$cheapest, $alts, $lastAPIPriceUpdate] = computeCheapestAndAlternatives($row, $detail, $cliAdults);
 
-                    if ($alts) {
+                    if ($verbose && $alts) {
                         foreach ($alts as $code => $info) {
-                            if ($verbose) {
-                                $lbl = CABIN_LABELS[$code] ?? $code;
-                                $pnp = $info['pnp'] !== null ? number_format((float)$info['pnp'], 0, ',', '.') . ' €/N' : '–';
-                                $amt = $info['amount'] !== null ? number_format((float)$info['amount'], 0, ',', '.') . ' €' : '–';
-                                logStatus("    - {$lbl} ({$code}): {$pnp} | {$amt}");
-                            }
+                            $lbl = CABIN_LABELS[$code] ?? $code;
+                            $pnp = $info['pnp'] !== null ? number_format((float)$info['pnp'], 0, ',', '.') . ' €/N' : '–';
+                            $amt = $info['amount'] !== null ? number_format((float)$info['amount'], 0, ',', '.') . ' €' : '–';
+                            logStatus("    - {$lbl} ({$code}): {$pnp} | {$amt}");
                         }
-                    } else {
-                        logStatus("    - Keine Kabinen-Preise gefunden.");
-                    }
-
-                    if ($cheapest) {
-                        $lbl = CABIN_LABELS[$cheapest['code']] ?? $cheapest['code'];
-                        $pnp = $cheapest['pnp'] !== null ? number_format((float)$cheapest['pnp'], 0, ',', '.') . ' €/N' : '–';
-                        $amt = $cheapest['amount'] !== null ? number_format((float)$cheapest['amount'], 0, ',', '.') . ' €' : '–';
-                        logStatus("    ✓ Günstigste: {$lbl} — {$pnp} | {$amt}");
-                    } else {
-                        logStatus("    ! Keine günstigste Option bestimmbar.");
                     }
 
                     $enriched = $row;
@@ -191,58 +178,62 @@ if (php_sapi_name() === 'cli') {
                     if ($cheapest) {
                         $enriched['amount'] = $cheapest['amount'];
                         $enriched['amountPerNightPerAdult'] = $cheapest['pnp'];
+                        $enriched['cheapest_code'] = $cheapest['code'] ?? null;
                     } else {
-                        unset($enriched['amount'], $enriched['amountPerNightPerAdult']);
+                        unset($enriched['amount'], $enriched['amountPerNightPerAdult'], $enriched['cheapest_code']);
                     }
                 }
 
                 // listAmount aktualisieren
                 $enriched['listAmount'] = $newListAmtByJid[$jid] ?? ($enriched['listAmount'] ?? null);
 
-                // added_at setzen, wenn wirklich neu (vorher nicht im Cache)
+                // added_at setzen/mitnehmen
                 if ($isNewInThisRun) {
                     $enriched['added_at'] = gmdate('c');
-                } else {
-                    // Vorhandenes beibehalten
-                    if (isset($oldMapByJid[$jid]['added_at'])) {
-                        $enriched['added_at'] = $oldMapByJid[$jid]['added_at'];
-                    }
+                } elseif (isset($oldMapByJid[$jid]['added_at'])) {
+                    $enriched['added_at'] = $oldMapByJid[$jid]['added_at'];
                 }
 
-                // Telegram: neues Item
+                // Telegram: „neu“
                 if ($isNewInThisRun) {
                     $tgEvents[] = ['type'=>'new', 'row'=>$enriched];
                 }
 
-                // Telegram: Preissenkung (nur wenn old vorhanden & neue amount vorhanden)
+                // Telegram: Preissenkung – mit Kabinentyp alt/neu
                 if (!$isNewInThisRun && isset($enriched['amount']) && isset($oldMapByJid[$jid]['amount'])) {
                     $oldAmt = (float)$oldMapByJid[$jid]['amount'];
                     $newAmt = (float)$enriched['amount'];
                     if ($newAmt < $oldAmt - 0.001) {
-                        $tgEvents[] = ['type'=>'drop', 'row'=>$enriched, 'delta'=>$newAmt-$oldAmt, 'old'=>$oldAmt];
+                        $tgEvents[] = [
+                                'type'=>'drop', 'row'=>$enriched,
+                                'delta'=>$newAmt-$oldAmt, 'old'=>$oldAmt,
+                                'oldType'=>$oldMapByJid[$jid]['cheapest']['code'] ?? ($oldMapByJid[$jid]['cheapest_code'] ?? null),
+                                'newType'=>$enriched['cheapest']['code'] ?? ($enriched['cheapest_code'] ?? null),
+                        ];
                     }
                 }
 
+                // Historie fortschreiben (pro Kabinentyp)
+                $history = upsertHistoryFromAlternatives($history, $jid, $enriched['alternatives'] ?? [], (int)($enriched['duration'] ?? 0), (int)$cliAdults);
+
                 $enrichedMap[$jid] = mergeMeta($enrichedMap[$jid] ?? null, $enriched, $row);
             } else {
-                // Pure reuse: alten enriched Datensatz nehmen und NUR Metadaten drüberlegen
+                // Reuse
                 $base = $enrichedMap[$jid] ?? ($oldMapByJid[$jid] ?? []);
                 $enrichedMap[$jid] = mergeMeta($base, $base, $row);
-                // listAmount updaten auch bei Reuse
                 $enrichedMap[$jid]['listAmount'] = $newListAmtByJid[$jid] ?? ($enrichedMap[$jid]['listAmount'] ?? null);
-                // added_at beibehalten
                 if (isset($oldMapByJid[$jid]['added_at'])) {
                     $enrichedMap[$jid]['added_at'] = $oldMapByJid[$jid]['added_at'];
                 }
             }
         }
 
-        // Journeys, die es nicht mehr in der Liste gibt, entfernen
+        // Entfernte Journeys raus
         foreach ($enrichedMap as $jid => $_row) {
             if (!isset($currentJids[$jid])) unset($enrichedMap[$jid]);
         }
 
-        // prev-Cache speichern nur bei Preisänderung (günstigste Option)
+        // prev-Cache speichern nur bei Preisänderung
         $enriched = array_values($enrichedMap);
         $changed = false;
         foreach ($enriched as $it) {
@@ -260,21 +251,33 @@ if (php_sapi_name() === 'cli') {
             logStatus("prev-Cache unverändert (keine Preisänderung).");
         }
 
-        // Hauptcache speichern & Daily-Marker setzen
+        // Hauptcache & Historie & Daily-Marker
         saveCache($cacheFile, $enriched);
+        saveHistory($histFile, $history);
         if ($daily) setDailyRefreshed($cliAdults);
 
-        // Telegram senden (falls konfiguriert)
+        // Telegram senden (falls konfiguriert) – optional max PNP Filter
         $sent = 0;
         foreach ($tgEvents as $ev) {
             if (!cfg('TELEGRAM_ENABLED', false)) continue;
+
+            // Benachrichtigungs-Filter: max PNP
+            $notifyMaxPnp = (float) cfg('TG_NOTIFY_MAX_PNP', 0);
+            $row = $ev['row'] ?? [];
+            $pnp = $row['amountPerNightPerAdult'] ?? null;
+            if ($notifyMaxPnp > 0 && $pnp !== null && (float)$pnp > $notifyMaxPnp) {
+                if ($verbose) logStatus("  - Skip Telegram (pnp ".(float)$pnp." > {$notifyMaxPnp})");
+                continue;
+            }
+
             $msg    = formatTgMessage($ev, $cliAdults);
-            $silent = tgShouldBeSilent($ev, $cliAdults);
-            if (tgSend($msg, $silent)) $sent++;
-            usleep(200000); // 0.2s small delay
+            if(tgShouldNotify($ev, $cliAdults)){
+                $silent = tgShouldBeSilent($ev, $cliAdults);
+                if (tgSend($msg, $silent)) $sent++;
+            }
+            usleep(200000);
         }
         if ($sent>0) logStatus("Telegram: {$sent} Benachrichtigungen gesendet.");
-        ;
 
         logStatus("Fertig. Cache gespeichert: ".basename($cacheFile)." (".count($enriched)." Reisen).");
         exit(0);
@@ -287,10 +290,9 @@ if (php_sapi_name() === 'cli') {
 
 /* ----------------------------- WEB MODE ----------------------------- */
 /* WICHTIG: Update-Parameter im Web werden ignoriert! */
-
 $adults   = isset($_GET['adults']) ? max(1, min(2, (int)$_GET['adults'])) : 1;
-$shipFilt = isset($_GET['ship']) ? trim((string)$_GET['ship']) : '';
-// Mehrfach-Auswahl der Schiffe (Checkbox-Dropdown)
+
+// Schiffe (Checkbox-Dropdown Auswahl)
 $shipFilt = '';
 if (!empty($_GET['ships']) && is_array($_GET['ships'])) {
     $shipFilt = implode(',', array_filter(array_map('trim', $_GET['ships'])));
@@ -305,8 +307,11 @@ $toFilt   = isset($_GET['to'])   ? trim((string)$_GET['to'])   : '';
 $minNights = isset($_GET['minDays']) ? max(0, (int)$_GET['minDays']) : 0;
 $maxNights = isset($_GET['maxDays']) ? max(0, (int)$_GET['maxDays']) : 0;
 
+// NEU: max €/Nacht/Person (Web)
+$maxPnp    = isset($_GET['maxPnp']) ? max(0, (int)$_GET['maxPnp']) : 0;
+
 $newOnly  = isset($_GET['newOnly']) ? (int)$_GET['newOnly'] === 1 : false;
-$newDaysQ = isset($_GET['newDays']) ? max(0, (int)$_GET['newDays']) : 0; // 0 = nimm Standard
+$newDaysQ = isset($_GET['newDays']) ? max(0, (int)$_GET['newDays']) : 0; // 0 = Standard
 
 // Mindest-Kabine: '', 'I','M','B','V','K','D','J','S','P'
 $minCabin  = isset($_GET['minCabin']) ? strtoupper(trim((string)$_GET['minCabin'])) : '';
@@ -314,15 +319,17 @@ if ($minCabin && !isset(CABIN_RANK[$minCabin])) $minCabin = '';
 
 $cacheFile     = CACHE_DIR . "/aida_adults{$adults}.json";
 $prevCacheFile = CACHE_DIR . "/aida_adults{$adults}_prev.json";
+$histFile      = CACHE_DIR . "/aida_adults{$adults}_history.json";
 
 [$items, $meta] = loadCache($cacheFile);
 $rows = is_array($items) ? $items : [];
 $prevMap = loadPrevMap($prevCacheFile);
+$history = loadHistory($histFile);
 
 // Filter anwenden
-$rows = applyFilters($rows, $shipFilt, $fromFilt, $toFilt, $minNights, $maxNights, $newOnly, $newDaysQ);
+$rows = applyFilters($rows, $shipFilt, $fromFilt, $toFilt, $minNights, $maxNights, $newOnly, $newDaysQ, $maxPnp);
 
-// Deltas berechnen (günstigste Option)
+// Deltas (günstigste Option)
 $changes=[];
 foreach ($rows as $r) {
     $jid=$r['journeyIdentifier']??null;
@@ -348,11 +355,11 @@ foreach ($rows as $r) {
     ];
 }
 
-// Sortieren (nach €/Nacht/Person)
+// Sortieren
 usort($rows, fn($a,$b)=>($a['amountPerNightPerAdult']??INF)<=>($b['amountPerNightPerAdult']??INF));
 
 // Render
-renderList($adults, $rows, $changes, $meta, $shipFilt, $fromFilt, $toFilt, $minNights, $maxNights, $minCabin, $newOnly, $newDaysQ, $selectedShips);
+renderList($adults, $rows, $changes, $meta, $shipFilt, $fromFilt, $toFilt, $minNights, $maxNights, $minCabin, $newOnly, $newDaysQ, $selectedShips, $maxPnp, $history);
 
 /* ========================== FUNKTIONEN ========================== */
 
@@ -569,7 +576,8 @@ function computeCheapestAndAlternatives(array $baseRow, ?array $detail, int $adu
             foreach (TARIFF_KEYS as $tKey) {
                 $t = $c[$tKey] ?? null;
                 if (!$t || (!isset($t['amount']) && !isset($t['amountPerPerson']))) continue;
-                $amt = isset($t['amount']) ? (float)$t['amount'] : (isset($t['amountPerPerson']) ? (float)$t['amountPerPerson'] * max(1,$adults) : null);
+                $amt = isset($t['amount']) ? (float)$t['amount'] :
+                        (isset($t['amountPerPerson']) ? (float)$t['amountPerPerson'] * max(1,$adults) : null);
                 if ($amt === null) continue;
                 if ($bestAmt === null || $amt < $bestAmt) {
                     $bestAmt  = $amt;
@@ -637,9 +645,60 @@ function loadPrevMap(string $prev): array {
     return $map;
 }
 
-// Metafelder (Titel/Zeiten/Schiff) aus frischer Liste übernehmen,
-// dabei Detail-Felder (cheapest/alternatives/amount/amountPerNightPerAdult/lastAPIPriceUpdate)
-// IMMER erhalten. journeyIdentifier & absLink werden garantiert gesetzt.
+/* ============ Preis-Historie (pro Reise & Kabinentyp) ============ */
+
+function loadHistory(string $file): array {
+    if (!is_file($file)) return [];
+    $raw = file_get_contents($file);
+    $js  = json_decode((string)$raw, true);
+    return is_array($js) ? $js : [];
+}
+
+function saveHistory(string $file, array $history): void {
+    $tmp = $file.'.tmp';
+    file_put_contents($tmp, json_encode($history, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
+    @rename($tmp, $file);
+}
+
+/**
+ * Ergänzt/aktualisiert Historie auf Basis der derzeitigen Alternativen.
+ * Struktur:
+ *   history[jid]['cabins'][code] = [
+ *      ['ts'=>'2025-01-01T12:00:00Z','pnp'=>123.45,'amount'=>999],
+ *      ...
+ *   ]
+ */
+function upsertHistoryFromAlternatives(array $history, string $jid, array $alts, int $duration, int $adults): array {
+    if (!$jid) return $history;
+    $now = gmdate('c');
+    if (!isset($history[$jid])) $history[$jid] = ['cabins'=>[]];
+
+    foreach ($alts as $code => $info) {
+        if (!isset($history[$jid]['cabins'][$code])) $history[$jid]['cabins'][$code] = [];
+        $series = &$history[$jid]['cabins'][$code];
+
+        $pnp = $info['pnp'] ?? null;
+        $amt = $info['amount'] ?? null;
+        // Nur schreiben, wenn realer Preis existiert
+        if ($pnp === null && $amt !== null && $duration > 0 && $adults > 0) {
+            $pnp = $amt / $duration / $adults;
+        }
+        if ($pnp === null) continue;
+
+        $last = end($series);
+        if (!$last || abs((float)$last['pnp'] - (float)$pnp) > 0.001) {
+            $series[] = ['ts'=>$now, 'pnp'=>(float)$pnp, 'amount'=> $amt !== null ? (float)$amt : null];
+            if (count($series) > 400) { // begrenzen
+                $series = array_slice($series, -400);
+            }
+        }
+        unset($series); // break ref
+    }
+    return $history;
+}
+
+/* -------- Metafelder mergen -------- */
+// Detail-Felder (cheapest/alternatives/amount/amountPerNightPerAdult/lastAPIPriceUpdate/cheapest_code) erhalten.
 function mergeMeta(?array $existing, array $enrichedOrOld, array $freshBase): array {
     $dst = $existing ?? $enrichedOrOld ?? [];
 
@@ -665,10 +724,8 @@ function mergeMeta(?array $existing, array $enrichedOrOld, array $freshBase): ar
     return $dst;
 }
 
-// Marker-Datei für täglichen Refresh (pro adults)
-function dailyMarkerFile(int $adults): string {
-    return CACHE_DIR . "/aida_adults{$adults}_daily.txt";
-}
+/* -------- Daily Marker -------- */
+function dailyMarkerFile(int $adults): string { return CACHE_DIR . "/aida_adults{$adults}_daily.txt"; }
 function shouldDailyRefresh(int $adults): bool {
     $f = dailyMarkerFile($adults);
     $today = date('Y-m-d');
@@ -721,18 +778,18 @@ function applyFilters(
         int $minNights,
         int $maxNights,
         bool $newOnly = false,
-        int $newDaysOverride = 0
+        int $newDaysOverride = 0,
+        int $maxPnp = 0
 ): array {
     $ships = array_filter(array_map('trim', explode(',', $shipFilt ?: '')));
     $fromT = $from ? strtotime($from.' 00:00:00') : null;
     $toT   = $to   ? strtotime($to.' 23:59:59')   : null;
 
-    // „neu seit … Tagen“
     $defaultDays = (int) cfg('NEW_BADGE_DAYS', 3);
     $days = $newDaysOverride > 0 ? $newDaysOverride : $defaultDays;
     $newCutoffTs = time() - ($days * 86400);
 
-    return array_values(array_filter($rows, function($r) use ($ships,$fromT,$toT,$minNights,$maxNights,$newOnly,$newCutoffTs) {
+    return array_values(array_filter($rows, function($r) use ($ships,$fromT,$toT,$minNights,$maxNights,$newOnly,$newCutoffTs,$maxPnp) {
         if ($ships) {
             $s = mb_strtolower((string)($r['shipName'] ?? ''));
             $ok = false;
@@ -753,10 +810,14 @@ function applyFilters(
             $added_at = isset($r['added_at']) ? strtotime($r['added_at']) : null;
             if (!$added_at || $added_at < $newCutoffTs) return false;
         }
+
+        if ($maxPnp > 0 && isset($r['amountPerNightPerAdult'])) {
+            if ((float)$r['amountPerNightPerAdult'] > $maxPnp) return false;
+        }
+
         return true;
     }));
 }
-
 
 /* ---------------------------- Rendering (Web) ---------------------------- */
 
@@ -773,9 +834,10 @@ function renderList(
         string $minCabin,
         bool $newOnly,
         int $newDaysQ,
-        $selectedShips
+        array $selectedShips = [],
+        float $maxPnp = 0.0,
+        array $history = []
 ): void {
-
 
     $updatedAt=$meta['updated_at'] ?? null;
     $count = count($rows);
@@ -792,11 +854,13 @@ function renderList(
             'minCabin' => $minCabin ?: null,
             'newOnly'  => $newOnly ? 1 : null,
             'newDays'  => $daysForNew ?: null,
+            'maxPnp'   => $maxPnp > 0 ? (int)$maxPnp : null,
     ], static fn($v) => $v !== null && $v !== '');
 
     $urlA1 = '?' . http_build_query($params + ['adults' => 1]);
     $urlA2 = '?' . http_build_query($params + ['adults' => 2]);
 
+    // Schiff-Menge aus aktuellen Rows für die Checkbox-Liste
     $shipSet=[];
     foreach ($rows as $r) { if (!empty($r['shipName'])) $shipSet[$r['shipName']]=true; }
     ksort($shipSet);
@@ -814,61 +878,34 @@ function renderList(
             .actions{display:flex;flex-wrap:wrap;gap:8px}
             .actions a{text-decoration:none;color:var(--fg);background:var(--card);border:1px solid var(--border);padding:10px 14px;border-radius:10px;font-size:14px;line-height:1.3}
             .actions a.active{outline:2px solid var(--accent)}.actions a:hover{background:#0e1a2d}
-            .filter{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0}
+            .filter{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0;align-items:center}
             .filter input,.filter select{background:#0e1a2d;border:1px solid var(--border);color:var(--fg);padding:8px 10px;border-radius:10px}
             .filter a.link, .filter button{background:#0e1a2d;border:1px solid var(--border);color:var(--fg);padding:8px 12px;border-radius:10px;text-decoration:none;cursor:pointer}
             .filter a.link:hover, .filter button:hover{background:#12233d}
+            .dropdown {position: relative;display: inline-block}
+            .dropbtn {background:#0e1a2d;color:var(--fg);border:1px solid var(--border);padding:8px 12px;border-radius:10px;cursor:pointer}
+            .dropdown-content {display:none;position:absolute;background:#0e1a2d;border:1px solid var(--border);border-radius:10px;min-width:220px;padding:6px;box-shadow:0 4px 14px rgba(0,0,0,0.3);z-index:10}
+            .dropdown-content label {display:flex;align-items:center;gap:6px;padding:4px 6px;font-size:14px;color:var(--fg)}
+            .dropdown-content label:hover {background:#12233d}
+            .dropdown:hover .dropdown-content {display:block}
             table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--border);border-radius:12px;overflow:hidden}
             thead th{text-align:left;padding:12px;font-size:13px;color:var(--muted);border-bottom:1px solid var(--border)}
             tbody td{padding:12px;border-bottom:1px solid var(--border);vertical-align:top}
             tbody tr:hover{background:#0f1b30}
             .numeric{text-align:right;white-space:nowrap}
-            .delta{font-size:12px;margin-left:6px}.delta.down{color:var(--down)}.delta.up{color:var(--up)}.delta.zero{color:var(--muted)}
             .center{text-align:center}
+            .delta{font-size:12px;margin-left:6px}.delta.down{color:var(--down)}.delta.up{color:var(--up)}.delta.zero{color:var(--muted)}
             .badge{font-size:12px;padding:2px 8px;border-radius:999px;border:1px solid var(--border);background:#0e1a2d}
             .badge.ok{color:var(--down);border-color:var(--down)}
             .badge.no{color:#f39c12;border-color:#f39c12}
             .new{margin-left:6px}
             a.link{color:var(--accent);text-decoration:none}a.link:hover{text-decoration:underline}
             .alt{color:var(--muted);font-size:12px;margin-top:4px}
-            .dropdown {
-                position: relative;
-                display: inline-block;
-            }
-            .dropbtn {
-                background: #0e1a2d;
-                color: var(--fg);
-                border: 1px solid var(--border);
-                padding: 8px 12px;
-                border-radius: 10px;
-                cursor: pointer;
-            }
-            .dropdown-content {
-                display: none;
-                position: absolute;
-                background: #0e1a2d;
-                border: 1px solid var(--border);
-                border-radius: 10px;
-                min-width: 180px;
-                padding: 6px;
-                box-shadow: 0 4px 14px rgba(0,0,0,0.3);
-                z-index: 10;
-            }
-            .dropdown-content label {
-                display: flex;
-                align-items: center;
-                gap: 6px;
-                padding: 4px 6px;
-                font-size: 14px;
-                color: var(--fg);
-            }
-            .dropdown-content label:hover {
-                background: #12233d;
-            }
-            .dropdown:hover .dropdown-content {
-                display: block;
-            }
-
+            details.chart{margin-top:6px}
+            .legend{display:flex;gap:10px;flex-wrap:wrap;margin:6px 0 2px 0;font-size:12px;color:var(--muted)}
+            .legend .key{display:inline-flex;align-items:center;gap:6px}
+            .legend .swatch{display:inline-block;width:12px;height:12px;border-radius:3px;border:1px solid var(--border)}
+            .pnp-max{width:150px}
             @media (max-width:768px){
                 header{flex-direction:column;align-items:flex-start}
                 h1{font-size:18px}
@@ -886,6 +923,7 @@ function renderList(
                 · <?php echo $updatedAt ? 'Zuletzt aktualisiert: '.e(date('d.m.Y H:i:s', strtotime($updatedAt))).' UTC' : 'Noch kein Update.'; ?>
                 · Reisen: <?php echo (int)$count; ?>
                 <?php if ($minCabin) echo ' · Mindest-Kabine: '.e(CABIN_LABELS[$minCabin] ?? $minCabin); ?>
+                <?php if ($maxPnp>0) echo ' · max €/N/Person: '.number_format($maxPnp,0,',','.'); ?>
             </div>
         </div>
         <div class="actions">
@@ -895,14 +933,12 @@ function renderList(
     </header>
 
     <form class="filter" method="get">
-        <input type="hidden" name="adults" value="<?php echo (int)$adults; ?>"><!-- Schiffe Multi-Select (Checkbox-Dropdown) -->
+        <input type="hidden" name="adults" value="<?php echo (int)$adults; ?>">
+
+        <!-- Schiffe Multi-Select (Checkbox-Dropdown) -->
         <div class="dropdown">
             <button type="button" class="dropbtn">Schiffe ▾</button>
             <div class="dropdown-content">
-                <label>
-                    <input type="checkbox" name="ships[]" value="" <?php echo empty($selectedShips)?'checked':''; ?>>
-                    <span>Alle Schiffe</span>
-                </label>
                 <?php foreach ($shipSet as $name => $_): ?>
                     <label>
                         <input type="checkbox" name="ships[]" value="<?php echo e($name); ?>"
@@ -912,10 +948,13 @@ function renderList(
                 <?php endforeach; ?>
             </div>
         </div>
+
         <input type="date" name="from" value="<?php echo e($fromFilt); ?>">
         <input type="date" name="to"   value="<?php echo e($toFilt); ?>">
         <input type="number" name="minDays" min="0" placeholder="min Tage" style="width:110px" value="<?php echo (int)$minNights; ?>">
         <input type="number" name="maxDays" min="0" placeholder="max Tage" style="width:110px" value="<?php echo (int)$maxNights; ?>">
+
+        <!-- Mindest-Kabine -->
         <select name="minCabin">
             <option value="">ab (alle Kabinen)</option>
             <option value="I" <?php echo $minCabin==='I'?'selected':''; ?>>ab Innen</option>
@@ -928,11 +967,18 @@ function renderList(
             <option value="J" <?php echo $minCabin==='J'?'selected':''; ?>>ab Junior Suite</option>
             <option value="S" <?php echo $minCabin==='S'?'selected':''; ?>>ab Suite</option>
         </select>
+
+        <!-- Neu-Filter -->
         <label style="display:flex;align-items:center;gap:6px">
             <input type="checkbox" name="newOnly" value="1" <?php echo $newOnly ? 'checked' : ''; ?>>
             nur neue
         </label>
         <input type="number" name="newDays" min="1" placeholder="Neu seit (Tage)" style="width:150px" value="<?php echo (int)$daysForNew; ?>">
+
+        <!-- Max Preis/Nacht/Person -->
+        <input class="pnp-max" type="number" name="maxPnp" min="0" step="1" placeholder="max €/N/Person"
+               value="<?php echo $maxPnp>0 ? (int)$maxPnp : ''; ?>">
+
         <button type="submit">Filtern</button>
         <a class="link" href="?adults=<?php echo (int)$adults; ?>">Zurücksetzen</a>
     </form>
@@ -970,12 +1016,16 @@ function renderList(
                 $cheFiltered  = pickCheapestFromAlts($altsFiltered);
                 if (!$cheFiltered) { continue; }
 
+                // Max pnp Filter (falls in den Query-Parametern angegeben)
+                if ($maxPnp > 0 && isset($cheFiltered['pnp']) && $cheFiltered['pnp'] > $maxPnp) { continue; }
+
                 $amount = $cheFiltered['amount'] ?? null;
                 $pnp    = $cheFiltered['pnp'] ?? null;
 
                 $fmtTotal = $amount===null ? '-' : number_format((float)$amount, 0, ',', '.').' '.CURRENCY;
                 $fmtPnp   = $pnp===null ? '-' : number_format((float)$pnp, 0, ',', '.').' '.CURRENCY;
 
+                // Alternativen-Tooltip
                 $altParts = [];
                 foreach ($altsFiltered as $code=>$info) {
                     if ($code === ($cheFiltered['code'] ?? null)) continue;
@@ -984,9 +1034,10 @@ function renderList(
                     if ($pp !== null) $altParts[] = $label.': '.number_format((float)$pp,0,',','.').' '.CURRENCY.'/N';
                 }
                 $altText = $altParts ? implode(' | ', $altParts) : 'keine Alternativen';
-                $cabinName = $cheFiltered['name'] ?? (CABIN_LABELS[$cheFiltered['code'] ?? ''] ?? ($cheFiltered['code'] ?? 'Kabine'));
+                $cabinCode = $cheFiltered['code'] ?? '';
+                $cabinName = $cheFiltered['name'] ?? (CABIN_LABELS[$cabinCode] ?? ($cabinCode ?: 'Kabine'));
 
-                // Deltas
+                // Deltas (auf Basis prevCache günstigste Option; ggf. wechselt Typ)
                 $deltaNightStr = '';
                 if (isset($changes[$jid]) && $changes[$jid]['deltaNightPerAdult'] !== null) {
                     $d = (float)$changes[$jid]['deltaNightPerAdult'];
@@ -1016,6 +1067,7 @@ function renderList(
                 $addedTitle = $added_at ? ('Hinzugefügt am '.date('d.m.Y H:i', strtotime($added_at)).' UTC') : 'Hinzugefügt: unbekannt';
 
                 $findLink = $jid ? buildFindLink($jid, $adults) : null;
+
                 ?>
                 <tr>
                     <td>
@@ -1026,11 +1078,9 @@ function renderList(
                             <?php endif; ?>
                             <?php echo e($title ?: $jid ?: '–'); ?>
                         </div>
-                        <?php if ($cabinName): ?>
-                            <div class="alt" title="<?php echo e($altText); ?>">
-                                <?php echo e($cabinName); ?> <span class="alt">(<?php echo e($altText); ?>)</span>
-                            </div>
-                        <?php endif; ?>
+                        <div class="alt" title="<?php echo e($altText); ?>">
+                            <?php echo e($cabinName); ?> <span class="alt">(<?php echo e($altText); ?>)</span>
+                        </div>
                     </td>
                     <td><?php echo e($ship ?: '–'); ?></td>
                     <td><?php echo e($start ?: '–'); ?> – <?php echo e($end ?: '–'); ?></td>
@@ -1053,6 +1103,27 @@ function renderList(
 }
 
 /* ---------------------------- Telegram ---------------------------- */
+/**
+ * Erwartete Event-Formate:
+ *  - NEW:
+ *      ['type'=>'new','row'=>[...]]
+ *      Optional in row: ['cheapest'=>['code'=>'M','pnp'=>..,'amount'=>..]]
+ *  - DROP (Preissenkung):
+ *      [
+ *        'type'=>'drop',
+ *        'row'=>[...],                 // aktueller Datensatz (mit cheapest/code)
+ *        'delta'=>float,               // newAmount - oldAmount (negativ)
+ *        'old'=>float,                 // alter Gesamtpreis
+ *        'oldCheapestCode'=>'I'        // optional: vorher günstigster Kabinentyp
+ *      ]
+ *
+ * Benötigte Config in config.php:
+ *  TELEGRAM_ENABLED (bool)
+ *  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+ *  TG_DEFAULT_SILENT (bool, default true)
+ *  TG_PNP_ALERT_THRESHOLD (float, <= Schwellwert => NICHT stumm)
+ *  TG_MAX_PNP_NOTIFY (float, >0: nur benachrichtigen, wenn pnp <= Wert)
+ */
 
 function tgSend(string $text, bool $silent = true): bool {
     $token = cfg('TELEGRAM_BOT_TOKEN', '');
@@ -1061,9 +1132,8 @@ function tgSend(string $text, bool $silent = true): bool {
 
     $url = "https://api.telegram.org/bot{$token}/sendMessage";
     $post = http_build_query([
-            'chat_id' => $chat,
-            'text'    => $text,
-        // kein parse_mode -> plain text, robust bei Sonderzeichen
+            'chat_id'                  => $chat,
+            'text'                     => $text,              // Plaintext, robust ggü. Sonderzeichen
             'disable_web_page_preview' => true,
             'disable_notification'     => $silent,
     ]);
@@ -1083,37 +1153,61 @@ function tgSend(string $text, bool $silent = true): bool {
     return ($err === 0 && $code >= 200 && $code < 300);
 }
 
+/**
+ * Entscheidet, ob ein Event überhaupt gesendet werden soll (Max-Preis/Nacht Filter).
+ * - TG_MAX_PNP_NOTIFY: Wenn > 0, werden NUR Events gesendet, deren pnp <= Schwelle ist.
+ */
+function tgShouldNotify(array $ev, int $adults): bool {
+    $maxPnp = (float) cfg('TG_MAX_PNP_NOTIFY', 0);
+    if ($maxPnp <= 0) return true; // kein Limit
+
+    $r = $ev['row'] ?? [];
+    $pnp = null;
+
+    if (isset($r['amountPerNightPerAdult'])) {
+        $pnp = (float)$r['amountPerNightPerAdult'];
+    } elseif (isset($r['amount'], $r['duration']) && $r['duration'] && $adults > 0) {
+        $pnp = (float)$r['amount'] / (int)$r['duration'] / $adults;
+    }
+
+    return ($pnp !== null) ? ($pnp <= $maxPnp) : true;
+}
+
+/**
+ * Steuert stumm/laute Zustellung:
+ *  - Standard kommt aus TG_DEFAULT_SILENT (default true).
+ *  - Wenn pnp <= TG_PNP_ALERT_THRESHOLD, dann NICHT stumm (laute Push).
+ */
 function tgShouldBeSilent(array $ev, int $adults): bool {
-    // Default: aus config (fällt auf true zurück)
     $defaultSilent = (bool) (cfg('TG_DEFAULT_SILENT', true));
+    $threshold     = (float) (cfg('TG_PNP_ALERT_THRESHOLD', 0));
 
-    // Schwellwert für „laut“ (<= threshold)
-    $threshold = (float) (cfg('TG_PNP_ALERT_THRESHOLD', 0));
-
-    // pnp (€/N/Person) aus dem Datensatz ziehen
     $r   = $ev['row'] ?? [];
     $pnp = null;
 
     if (isset($r['amountPerNightPerAdult'])) {
         $pnp = (float)$r['amountPerNightPerAdult'];
-    } else {
-        // Falls nicht gesetzt: aus amount/duration/adults ableiten (best effort)
-        $amount = isset($r['amount']) ? (float)$r['amount'] : null;
-        $dur    = isset($r['duration']) ? (int)$r['duration'] : null;
-        if ($amount !== null && $dur && $adults > 0) {
-            $pnp = $amount / $dur / $adults;
-        }
+    } elseif (isset($r['amount'], $r['duration']) && $r['duration'] && $adults > 0) {
+        $pnp = (float)$r['amount'] / (int)$r['duration'] / $adults;
     }
 
     if ($threshold > 0 && $pnp !== null && $pnp <= $threshold) {
-        // Unter/gleich Schwellwert → laut senden (also NICHT stumm)
-        return false;
+        return false; // laut
     }
-    // Sonst Grundverhalten (stumm)
-    return $defaultSilent;
+    return $defaultSilent; // sonst Standard (meist stumm)
 }
 
+/** Kleines Label-Helper */
+function cabinLabelFor(string $code): string {
+    return CABIN_LABELS[$code] ?? $code;
+}
 
+/**
+ * Baut den Telegram-Text.
+ * - Enthält Anzahl Personen im Titel
+ * - „Neue Reise“ inkl. günstigstem Kabinentyp
+ * - „Preissenkung“ inkl. altem & neuem Kabinentyp (falls verfügbar)
+ */
 function formatTgMessage(array $ev, int $adults): string {
     $r = $ev['row'] ?? [];
     $title = (string)($r['title'] ?? ($r['journeyIdentifier'] ?? 'Reise'));
@@ -1123,15 +1217,31 @@ function formatTgMessage(array $ev, int $adults): string {
     $dur   = (int)($r['duration'] ?? 0);
     $pnp   = isset($r['amountPerNightPerAdult']) ? (float)$r['amountPerNightPerAdult'] : null;
     $amt   = isset($r['amount']) ? (float)$r['amount'] : null;
-    $link  = buildFindLink((string)$r['journeyIdentifier'], $adults);
+
+    $jid   = (string)($r['journeyIdentifier'] ?? '');
+    $link  = $jid ? buildFindLink($jid, $adults) : '';
+
+    $newCode = $r['cheapest']['code'] ?? null; // bevorzugt aus 'cheapest'
+    if (!$newCode && isset($r['alternatives']) && is_array($r['alternatives'])) {
+        // Fallback: günstigste Alternative anhand pnp bestimmen
+        $best = null; $bestCode = null;
+        foreach ($r['alternatives'] as $c=>$info) {
+            $pp = $info['pnp'] ?? null;
+            if ($pp === null) continue;
+            if ($best === null || $pp < $best) { $best=$pp; $bestCode=$c; }
+        }
+        $newCode = $bestCode;
+    }
+    $newCodeLbl = $newCode ? cabinLabelFor((string)$newCode).' ('.(string)$newCode.')' : null;
 
     if (($ev['type'] ?? '') === 'new') {
         $lines = [
-                "🆕 Neue Reise ($adults PAX)",
+                "🆕 Neue Reise ({$adults} PAX)",
                 $title,
                 $ship ? "Schiff: {$ship}" : null,
                 $dur ? "Nächte: {$dur}" : null,
                 ($start && $end) ? "Zeitraum: {$start} – {$end}" : null,
+                ($newCodeLbl ? "Günstigster Typ: {$newCodeLbl}" : null),
                 ($pnp !== null ? "ab: ".number_format($pnp,0,',','.')." ".CURRENCY."/N/Person" : null),
                 ($amt !== null ? "Gesamt: ".number_format($amt,0,',','.')." ".CURRENCY : null),
                 $link,
@@ -1140,17 +1250,22 @@ function formatTgMessage(array $ev, int $adults): string {
     }
 
     if (($ev['type'] ?? '') === 'drop') {
-        $old  = (float)($ev['old'] ?? 0.0);
-        $new  = (float)($r['amount'] ?? 0.0);
-        $diff = $new - $old; // negativ
+        $oldTotal  = (float)($ev['old'] ?? 0.0);
+        $newTotal  = (float)($r['amount'] ?? 0.0);
+        $diff      = $newTotal - $oldTotal; // negativ
+        $oldCode   = $ev['oldCheapestCode'] ?? null;
+        $oldCodeLbl= $oldCode ? cabinLabelFor((string)$oldCode).' ('.(string)$oldCode.')' : null;
+
         $lines = [
-                "💸 Preissenkung ($adults PAX)",
+                "💸 Preissenkung ({$adults} PAX)",
                 $title,
                 $ship ? "Schiff: {$ship}" : null,
                 $dur ? "Nächte: {$dur}" : null,
                 ($start && $end) ? "Zeitraum: {$start} – {$end}" : null,
-                "Alt: ".number_format($old,0,',','.')." ".CURRENCY,
-                "Neu: ".number_format($new,0,',','.')." ".CURRENCY." (".number_format($diff,0,',','.')." ".CURRENCY.")",
+                ($oldCodeLbl ? "Alt. Typ: {$oldCodeLbl}" : null),
+                ($newCodeLbl ? "Neu. Typ: {$newCodeLbl}" : null),
+                "Alt: ".number_format($oldTotal,0,',','.')." ".CURRENCY,
+                "Neu: ".number_format($newTotal,0,',','.')." ".CURRENCY." (".number_format($diff,0,',','.')." ".CURRENCY.")",
                 ($pnp !== null ? "ab: ".number_format((float)$r['amountPerNightPerAdult'],0,',','.')." ".CURRENCY."/N/Person" : null),
                 $link,
         ];
@@ -1158,5 +1273,5 @@ function formatTgMessage(array $ev, int $adults): string {
     }
 
     // Fallback
-    return $title."\n".$link;
+    return trim($title."\n".$link);
 }
