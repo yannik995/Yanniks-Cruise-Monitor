@@ -154,6 +154,7 @@ if (php_sapi_name() === 'cli') {
                     } else {
                         $enriched = $row;
                         $enriched['journeyIdentifier'] = $jid;
+                        $enriched['added_at'] = gmdate('c');
                         $enriched['absLink'] = buildFindLink($jid, $cliAdults);
                     }
                 } else {
@@ -289,11 +290,23 @@ if (php_sapi_name() === 'cli') {
 
 $adults   = isset($_GET['adults']) ? max(1, min(2, (int)$_GET['adults'])) : 1;
 $shipFilt = isset($_GET['ship']) ? trim((string)$_GET['ship']) : '';
+// Mehrfach-Auswahl der Schiffe (Checkbox-Dropdown)
+$shipFilt = '';
+if (!empty($_GET['ships']) && is_array($_GET['ships'])) {
+    $shipFilt = implode(',', array_filter(array_map('trim', $_GET['ships'])));
+} elseif (!empty($_GET['ship'])) {
+    $shipFilt = trim((string)$_GET['ship']);
+}
+$selectedShips = array_filter(array_map('trim', explode(',', $shipFilt)));
+
 $fromFilt = isset($_GET['from']) ? trim((string)$_GET['from']) : '';
 $toFilt   = isset($_GET['to'])   ? trim((string)$_GET['to'])   : '';
 
 $minNights = isset($_GET['minDays']) ? max(0, (int)$_GET['minDays']) : 0;
 $maxNights = isset($_GET['maxDays']) ? max(0, (int)$_GET['maxDays']) : 0;
+
+$newOnly  = isset($_GET['newOnly']) ? (int)$_GET['newOnly'] === 1 : false;
+$newDaysQ = isset($_GET['newDays']) ? max(0, (int)$_GET['newDays']) : 0; // 0 = nimm Standard
 
 // Mindest-Kabine: '', 'I','M','B','V','K','D','J','S','P'
 $minCabin  = isset($_GET['minCabin']) ? strtoupper(trim((string)$_GET['minCabin'])) : '';
@@ -307,7 +320,7 @@ $rows = is_array($items) ? $items : [];
 $prevMap = loadPrevMap($prevCacheFile);
 
 // Filter anwenden
-$rows = applyFilters($rows, $shipFilt, $fromFilt, $toFilt, $minNights, $maxNights);
+$rows = applyFilters($rows, $shipFilt, $fromFilt, $toFilt, $minNights, $maxNights, $newOnly, $newDaysQ);
 
 // Deltas berechnen (günstigste Option)
 $changes=[];
@@ -339,7 +352,7 @@ foreach ($rows as $r) {
 usort($rows, fn($a,$b)=>($a['amountPerNightPerAdult']??INF)<=>($b['amountPerNightPerAdult']??INF));
 
 // Render
-renderList($adults, $rows, $changes, $meta, $shipFilt, $fromFilt, $toFilt, $minNights, $maxNights, $minCabin);
+renderList($adults, $rows, $changes, $meta, $shipFilt, $fromFilt, $toFilt, $minNights, $maxNights, $minCabin, $newOnly, $newDaysQ, $selectedShips);
 
 /* ========================== FUNKTIONEN ========================== */
 
@@ -638,6 +651,10 @@ function mergeMeta(?array $existing, array $enrichedOrOld, array $freshBase): ar
         $dst['journeyIdentifier'] = $enrichedOrOld['journeyIdentifier'];
     }
 
+    if (!empty($enrichedOrOld['added_at']) && empty($dst['added_at'])) {
+        $dst['added_at'] = $enrichedOrOld['added_at'];
+    }
+
     foreach (['title','shipName','startDate','endDate','duration','routeCode','routeGroupCode','adults','flightIncluded'] as $k) {
         if (array_key_exists($k, $freshBase)) $dst[$k] = $freshBase[$k];
     }
@@ -696,12 +713,26 @@ function pickCheapestFromAlts(array $alts): ?array {
     return $best;
 }
 
-function applyFilters(array $rows, string $shipFilt, string $from, string $to, int $minNights, int $maxNights): array {
+function applyFilters(
+        array $rows,
+        string $shipFilt,
+        string $from,
+        string $to,
+        int $minNights,
+        int $maxNights,
+        bool $newOnly = false,
+        int $newDaysOverride = 0
+): array {
     $ships = array_filter(array_map('trim', explode(',', $shipFilt ?: '')));
     $fromT = $from ? strtotime($from.' 00:00:00') : null;
     $toT   = $to   ? strtotime($to.' 23:59:59')   : null;
 
-    return array_values(array_filter($rows, function($r) use ($ships,$fromT,$toT,$minNights,$maxNights) {
+    // „neu seit … Tagen“
+    $defaultDays = (int) cfg('NEW_BADGE_DAYS', 3);
+    $days = $newDaysOverride > 0 ? $newDaysOverride : $defaultDays;
+    $newCutoffTs = time() - ($days * 86400);
+
+    return array_values(array_filter($rows, function($r) use ($ships,$fromT,$toT,$minNights,$maxNights,$newOnly,$newCutoffTs) {
         if ($ships) {
             $s = mb_strtolower((string)($r['shipName'] ?? ''));
             $ok = false;
@@ -718,9 +749,14 @@ function applyFilters(array $rows, string $shipFilt, string $from, string $to, i
         if ($minNights && $dur && $dur < $minNights) return false;
         if ($maxNights && $dur && $dur > $maxNights) return false;
 
+        if ($newOnly) {
+            $added_at = isset($r['added_at']) ? strtotime($r['added_at']) : null;
+            if (!$added_at || $added_at < $newCutoffTs) return false;
+        }
         return true;
     }));
 }
+
 
 /* ---------------------------- Rendering (Web) ---------------------------- */
 
@@ -734,11 +770,18 @@ function renderList(
         string $toFilt,
         int $minNights,
         int $maxNights,
-        string $minCabin
+        string $minCabin,
+        bool $newOnly,
+        int $newDaysQ,
+        $selectedShips
 ): void {
+
 
     $updatedAt=$meta['updated_at'] ?? null;
     $count = count($rows);
+
+    $daysForNew = $newDaysQ > 0 ? $newDaysQ : (int) cfg('NEW_BADGE_DAYS', 3);
+    $newCutoffTs = time() - ($daysForNew * 86400);
 
     $params = array_filter([
             'ship'     => $shipFilt ?: null,
@@ -747,6 +790,8 @@ function renderList(
             'minDays'  => $minNights ?: null,
             'maxDays'  => $maxNights ?: null,
             'minCabin' => $minCabin ?: null,
+            'newOnly'  => $newOnly ? 1 : null,
+            'newDays'  => $daysForNew ?: null,
     ], static fn($v) => $v !== null && $v !== '');
 
     $urlA1 = '?' . http_build_query($params + ['adults' => 1]);
@@ -786,6 +831,44 @@ function renderList(
             .new{margin-left:6px}
             a.link{color:var(--accent);text-decoration:none}a.link:hover{text-decoration:underline}
             .alt{color:var(--muted);font-size:12px;margin-top:4px}
+            .dropdown {
+                position: relative;
+                display: inline-block;
+            }
+            .dropbtn {
+                background: #0e1a2d;
+                color: var(--fg);
+                border: 1px solid var(--border);
+                padding: 8px 12px;
+                border-radius: 10px;
+                cursor: pointer;
+            }
+            .dropdown-content {
+                display: none;
+                position: absolute;
+                background: #0e1a2d;
+                border: 1px solid var(--border);
+                border-radius: 10px;
+                min-width: 180px;
+                padding: 6px;
+                box-shadow: 0 4px 14px rgba(0,0,0,0.3);
+                z-index: 10;
+            }
+            .dropdown-content label {
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                padding: 4px 6px;
+                font-size: 14px;
+                color: var(--fg);
+            }
+            .dropdown-content label:hover {
+                background: #12233d;
+            }
+            .dropdown:hover .dropdown-content {
+                display: block;
+            }
+
             @media (max-width:768px){
                 header{flex-direction:column;align-items:flex-start}
                 h1{font-size:18px}
@@ -812,13 +895,23 @@ function renderList(
     </header>
 
     <form class="filter" method="get">
-        <input type="hidden" name="adults" value="<?php echo (int)$adults; ?>">
-        <select name="ship">
-            <option value="">Alle Schiffe</option>
-            <?php foreach ($shipSet as $name => $_): ?>
-                <option value="<?php echo e($name); ?>" <?php echo ($shipFilt===$name)?'selected':''; ?>><?php echo e($name); ?></option>
-            <?php endforeach; ?>
-        </select>
+        <input type="hidden" name="adults" value="<?php echo (int)$adults; ?>"><!-- Schiffe Multi-Select (Checkbox-Dropdown) -->
+        <div class="dropdown">
+            <button type="button" class="dropbtn">Schiffe ▾</button>
+            <div class="dropdown-content">
+                <label>
+                    <input type="checkbox" name="ships[]" value="" <?php echo empty($selectedShips)?'checked':''; ?>>
+                    <span>Alle Schiffe</span>
+                </label>
+                <?php foreach ($shipSet as $name => $_): ?>
+                    <label>
+                        <input type="checkbox" name="ships[]" value="<?php echo e($name); ?>"
+                                <?php echo in_array($name, $selectedShips, true)?'checked':''; ?>>
+                        <span><?php echo e($name); ?></span>
+                    </label>
+                <?php endforeach; ?>
+            </div>
+        </div>
         <input type="date" name="from" value="<?php echo e($fromFilt); ?>">
         <input type="date" name="to"   value="<?php echo e($toFilt); ?>">
         <input type="number" name="minDays" min="0" placeholder="min Tage" style="width:110px" value="<?php echo (int)$minNights; ?>">
@@ -835,7 +928,11 @@ function renderList(
             <option value="J" <?php echo $minCabin==='J'?'selected':''; ?>>ab Junior Suite</option>
             <option value="S" <?php echo $minCabin==='S'?'selected':''; ?>>ab Suite</option>
         </select>
-
+        <label style="display:flex;align-items:center;gap:6px">
+            <input type="checkbox" name="newOnly" value="1" <?php echo $newOnly ? 'checked' : ''; ?>>
+            nur neue
+        </label>
+        <input type="number" name="newDays" min="1" placeholder="Neu seit (Tage)" style="width:150px" value="<?php echo (int)$daysForNew; ?>">
         <button type="submit">Filtern</button>
         <a class="link" href="?adults=<?php echo (int)$adults; ?>">Zurücksetzen</a>
     </form>
@@ -914,20 +1011,21 @@ function renderList(
                 }
 
                 // 🆕 Badge (wenn added_at vorhanden & frisch)
-                $newBadge = '';
-                if (!empty($r['added_at'])) {
-                    $addedTs = strtotime($r['added_at']);
-                    if ($addedTs && (time() - $addedTs) <= NEW_BADGE_DAYS*86400) {
-                        $titleNew = 'Hinzugefügt am '.date('d.m.Y H:i:s', $addedTs).' UTC';
-                        $newBadge = '<span class="new" title="'.e($titleNew).'">🆕</span>';
-                    }
-                }
+                $added_at = $r['added_at'] ?? null;
+                $isNew   = $added_at && (strtotime($added_at) >= $newCutoffTs);
+                $addedTitle = $added_at ? ('Hinzugefügt am '.date('d.m.Y H:i', strtotime($added_at)).' UTC') : 'Hinzugefügt: unbekannt';
 
                 $findLink = $jid ? buildFindLink($jid, $adults) : null;
                 ?>
                 <tr>
                     <td>
-                        <div><?php echo e($title ?: $jid ?: '–'); ?> <?php echo $newBadge; ?></div>
+                        <div>
+                            <?php if ($isNew): ?>
+                                <span class="badge new" title="<?php echo e($addedTitle); ?>">🆕</span>
+                                &nbsp;
+                            <?php endif; ?>
+                            <?php echo e($title ?: $jid ?: '–'); ?>
+                        </div>
                         <?php if ($cabinName): ?>
                             <div class="alt" title="<?php echo e($altText); ?>">
                                 <?php echo e($cabinName); ?> <span class="alt">(<?php echo e($altText); ?>)</span>
@@ -1029,7 +1127,7 @@ function formatTgMessage(array $ev, int $adults): string {
 
     if (($ev['type'] ?? '') === 'new') {
         $lines = [
-                "🆕 Neue Reise",
+                "🆕 Neue Reise ($adults PAX)",
                 $title,
                 $ship ? "Schiff: {$ship}" : null,
                 $dur ? "Nächte: {$dur}" : null,
@@ -1046,7 +1144,7 @@ function formatTgMessage(array $ev, int $adults): string {
         $new  = (float)($r['amount'] ?? 0.0);
         $diff = $new - $old; // negativ
         $lines = [
-                "💸 Preissenkung",
+                "💸 Preissenkung ($adults PAX)",
                 $title,
                 $ship ? "Schiff: {$ship}" : null,
                 $dur ? "Nächte: {$dur}" : null,
