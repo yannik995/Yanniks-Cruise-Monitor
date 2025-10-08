@@ -2,11 +2,12 @@
 /*******************************************************
  * Yanniks CruiseMonitor
  * WEB:
- *   - Anzeige + Filter (adults/ship/from/to)
+ *   - Anzeige + Filter (adults/ship/from/to, min/max Tage, Mindest-Kabine)
  * CLI:
- *   - php yanniks-cruisemonitor.php --update --adults=1
- *   - Lädt Liste (size=1000) + Kabinen-Details pro Reise
+ *   - php yanniks-cruisemonitor.php --update --adults=1 [--verbose]
+ *   - Lädt Liste (size=1000) + Kabinen-Details pro Reise (nur bei neu/Preisänderung in List-API oder 1x täglich)
  *   - Status-Logs: Reise, Kabinen, Preise, günstigste Option
+ *   - Telegram-Notify: neue Reisen & Preissenkungen
  *******************************************************/
 declare(strict_types=1);
 
@@ -17,6 +18,14 @@ const LIST_BASE       = 'https://aida.de/content/aida-search-and-booking/request
 const DETAIL_BASE     = 'https://aida.de/content/aida-search-and-booking/requests/detail.content.json';
 const USER_AGENT      = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const CURRENCY        = '€';
+
+// Anzeige "neu" - wie viele Tage ab "added_at" das 🆕-Badge sichtbar ist
+const NEW_BADGE_DAYS  = 1;
+
+// Telegram
+const TG_ENABLED    = false; // auf false setzen, wenn deaktivieren
+const TELEGRAM_BOT_TOKEN = '';
+const TELEGRAM_CHAT_ID   = '';
 
 // Reihenfolge: je höher, desto „besser“
 const CABIN_RANK = ['I'=>1,'M'=>2,'B'=>3,'V'=>4,'K'=>5,'D'=>6,'P'=>7,'J'=>8,'S'=>9];
@@ -61,7 +70,7 @@ if (php_sapi_name() === 'cli') {
         // Live-Liste holen
         warmUpAida($cookieFile);
         $resp = fetchAidaList($cliAdults, 1, SIZE_PER_PAGE, $cookieFile);
-        $baseRows = extractVariantsFromList($resp, $cliAdults); // enthält listAmount
+        $baseRows = extractVariantsFromList($resp, $cliAdults); // enthält listAmount & flightIncluded
         $total = count($baseRows);
         if ($total === 0) throw new RuntimeException('AIDA API ergab 0 Reisen.');
 
@@ -69,12 +78,10 @@ if (php_sapi_name() === 'cli') {
         $currentJids = [];
         $newListAmtByJid = [];
         foreach ($baseRows as $row) {
-
             $jid = $row['journeyIdentifier'] ?? null;
             if (!$jid) continue;
             $currentJids[$jid] = true;
             $newListAmtByJid[$jid] = array_key_exists('listAmount', $row) ? $row['listAmount'] : null;
-
         }
 
         // Daily-Flag
@@ -84,11 +91,10 @@ if (php_sapi_name() === 'cli') {
         // Entscheiden, für welche Journeys die Detail-API nötig ist (Vergleich nur über listAmount des Hauptcaches)
         $needDetail = [];    // jids, die wir neu ziehen
         $reuseOnly  = [];    // jids, die wir aus altem enriched übernehmen können
+        $newJids    = [];    // in diesem Lauf neu in der Liste
 
         foreach ($baseRows as $row) {
             $jid = $row['journeyIdentifier'] ?? null; if (!$jid) continue;
-
-
 
             $oldListAmt = isset($oldMapByJid[$jid]['listAmount']) ? (int)$oldMapByJid[$jid]['listAmount'] : null;
             $newListAmt = isset($newListAmtByJid[$jid]) ? (int)$newListAmtByJid[$jid] : null;
@@ -96,7 +102,7 @@ if (php_sapi_name() === 'cli') {
             $isNew      = !isset($oldMapByJid[$jid]);
             $amtChanged = ($isNew || $newListAmt !== $oldListAmt);
 
-
+            if ($isNew) { $newJids[$jid] = true; }
 
             if ($daily || $isNew || $amtChanged) {
                 $needDetail[] = $jid;
@@ -107,21 +113,24 @@ if (php_sapi_name() === 'cli') {
 
         logStatus("Reisen gesamt: {$total}. Details nötig für: ".count($needDetail).", Reuse: ".count($reuseOnly));
 
-        // Enrichment: für needDetail wirklich Detail-API aufrufen, sonst aus alt übernehmen
+        // Enrichment
         $enrichedMap = []; // jid => enriched row
 
-        // 1) Reuse-Items zuerst befüllen
         foreach ($reuseOnly as $jid) {
             $enrichedMap[$jid] = $oldMapByJid[$jid];
+            // listAmount updaten
+            $enrichedMap[$jid]['listAmount'] = $newListAmtByJid[$jid] ?? ($enrichedMap[$jid]['listAmount'] ?? null);
         }
 
-        // 2) Detail-Calls für geänderte/neue
+        // Telegram-Events sammeln
+        $tgEvents = []; // ['type'=>'new'|'drop', 'row'=>[], 'delta'=>float, 'old'=>float]
+
+        // Detail-Calls für geänderte/neue
         $i = 0; $n = count($needDetail);
         foreach ($baseRows as $row) {
             $jid = $row['journeyIdentifier'] ?? null; if (!$jid) continue;
 
-            // Wenn bereits via reuse befüllt, später nur Meta (title/ship/dates) updaten
-            $isReuse = isset($enrichedMap[$jid]);
+            $isNewInThisRun = isset($newJids[$jid]);
 
             if (in_array($jid, $needDetail, true)) {
                 $i++;
@@ -132,12 +141,10 @@ if (php_sapi_name() === 'cli') {
                 if (!$detail) {
                     logStatus("  ! Keine Detail-Daten (API blockiert/leer). Reuse alter Details falls vorhanden.");
                     if (isset($oldMapByJid[$jid])) {
-                        // Alte Details übernehmen & nur Metadaten (Titel/Zeiten/Schiff) aktualisieren
                         $enriched = mergeMeta($oldMapByJid[$jid], $oldMapByJid[$jid], $row);
                     } else {
-                        // allerletzter Fallback: Basis + Link + ID setzen (Details fehlen dann halt)
                         $enriched = $row;
-                        $enriched['journeyIdentifier'] = $jid; // <- explizit setzen
+                        $enriched['journeyIdentifier'] = $jid;
                         $enriched['absLink'] = buildFindLink($jid, $cliAdults);
                     }
                 } else {
@@ -178,8 +185,33 @@ if (php_sapi_name() === 'cli') {
                         unset($enriched['amount'], $enriched['amountPerNightPerAdult']);
                     }
                 }
-                // listAmount immer aktualisieren
+
+                // listAmount aktualisieren
                 $enriched['listAmount'] = $newListAmtByJid[$jid] ?? ($enriched['listAmount'] ?? null);
+
+                // added_at setzen, wenn wirklich neu (vorher nicht im Cache)
+                if ($isNewInThisRun) {
+                    $enriched['added_at'] = gmdate('c');
+                } else {
+                    // Vorhandenes beibehalten
+                    if (isset($oldMapByJid[$jid]['added_at'])) {
+                        $enriched['added_at'] = $oldMapByJid[$jid]['added_at'];
+                    }
+                }
+
+                // Telegram: neues Item
+                if ($isNewInThisRun) {
+                    $tgEvents[] = ['type'=>'new', 'row'=>$enriched];
+                }
+
+                // Telegram: Preissenkung (nur wenn old vorhanden & neue amount vorhanden)
+                if (!$isNewInThisRun && isset($enriched['amount']) && isset($oldMapByJid[$jid]['amount'])) {
+                    $oldAmt = (float)$oldMapByJid[$jid]['amount'];
+                    $newAmt = (float)$enriched['amount'];
+                    if ($newAmt < $oldAmt - 0.001) {
+                        $tgEvents[] = ['type'=>'drop', 'row'=>$enriched, 'delta'=>$newAmt-$oldAmt, 'old'=>$oldAmt];
+                    }
+                }
 
                 $enrichedMap[$jid] = mergeMeta($enrichedMap[$jid] ?? null, $enriched, $row);
             } else {
@@ -188,14 +220,16 @@ if (php_sapi_name() === 'cli') {
                 $enrichedMap[$jid] = mergeMeta($base, $base, $row);
                 // listAmount updaten auch bei Reuse
                 $enrichedMap[$jid]['listAmount'] = $newListAmtByJid[$jid] ?? ($enrichedMap[$jid]['listAmount'] ?? null);
+                // added_at beibehalten
+                if (isset($oldMapByJid[$jid]['added_at'])) {
+                    $enrichedMap[$jid]['added_at'] = $oldMapByJid[$jid]['added_at'];
+                }
             }
         }
 
         // Journeys, die es nicht mehr in der Liste gibt, entfernen
         foreach ($enrichedMap as $jid => $_row) {
-
             if (!isset($currentJids[$jid])) unset($enrichedMap[$jid]);
-
         }
 
         // prev-Cache speichern nur bei Preisänderung (günstigste Option)
@@ -206,7 +240,7 @@ if (php_sapi_name() === 'cli') {
             if ($jid && isset($oldMapByJid[$jid])) {
                 $oldAmt = (float)($oldMapByJid[$jid]['amount'] ?? -1);
                 $newAmt = (float)($it['amount'] ?? -2);
-                if ($oldAmt !== $newAmt) { $changed = true; break; }
+                if (abs($oldAmt - $newAmt) > 0.001) { $changed = true; break; }
             }
         }
         if ($changed && is_file($cacheFile)) {
@@ -218,9 +252,15 @@ if (php_sapi_name() === 'cli') {
 
         // Hauptcache speichern & Daily-Marker setzen
         saveCache($cacheFile, $enriched);
-
         if ($daily) setDailyRefreshed($cliAdults);
 
+        // Telegram senden (falls konfiguriert)
+        $sent = 0;
+        foreach ($tgEvents as $ev) {
+            if (tgSend(formatTgMessage($ev, $cliAdults))) $sent++;
+            usleep(200000); // 0.2s small delay
+        }
+        if ($sent>0) logStatus("Telegram: {$sent} Benachrichtigungen gesendet.");
 
         logStatus("Fertig. Cache gespeichert: ".basename($cacheFile)." (".count($enriched)." Reisen).");
         exit(0);
@@ -282,7 +322,7 @@ foreach ($rows as $r) {
     ];
 }
 
-// Sortieren
+// Sortieren (nach €/Nacht/Person)
 usort($rows, fn($a,$b)=>($a['amountPerNightPerAdult']??INF)<=>($b['amountPerNightPerAdult']??INF));
 
 // Render
@@ -444,7 +484,7 @@ function extractVariantsFromList(array $resp, int $adults): array {
             $start    = $v['startDate'] ?? null;
             $end      = $v['endDate'] ?? null;
             $flightIncluded = (bool)($v['flightIncluded'] ?? false);
-            $listAmount = isset($v['amount']) ? (float)$v['amount'] : null; // << wichtig
+            $listAmount = isset($v['amount']) ? (float)$v['amount'] : null;
 
             $lastAPIPriceUpdate = null;
             if (!empty($v['campaigns'])) {
@@ -466,7 +506,7 @@ function extractVariantsFromList(array $resp, int $adults): array {
                     'adults'             => $adults,
                     'lastAPIPriceUpdate' => $lastAPIPriceUpdate,
                     'listAmount'         => $listAmount,
-                    'flightIncluded'      => $flightIncluded,
+                    'flightIncluded'     => $flightIncluded,
             ];
         }
     }
@@ -477,7 +517,6 @@ function extractVariantsFromList(array $resp, int $adults): array {
     }
     return $unique;
 }
-
 
 function computeCheapestAndAlternatives(array $baseRow, ?array $detail, int $adults): array {
     $duration = (int)($baseRow['duration'] ?? 0);
@@ -572,54 +611,40 @@ function loadPrevMap(string $prev): array {
     return $map;
 }
 
-
 // Metafelder (Titel/Zeiten/Schiff) aus frischer Liste übernehmen,
 // dabei Detail-Felder (cheapest/alternatives/amount/amountPerNightPerAdult/lastAPIPriceUpdate)
 // IMMER erhalten. journeyIdentifier & absLink werden garantiert gesetzt.
 function mergeMeta(?array $existing, array $enrichedOrOld, array $freshBase): array {
-    // Basis: wenn bereits ein bestehender Datensatz (mit Details) da ist, den nehmen,
-    // sonst den "alten/enriched" (falls vorhanden), sonst eine leere Hülle.
     $dst = $existing ?? $enrichedOrOld ?? [];
 
-    // Immer sicherstellen: Journey-ID bleibt erhalten
     if (!empty($freshBase['journeyIdentifier'])) {
         $dst['journeyIdentifier'] = $freshBase['journeyIdentifier'];
     } elseif (!empty($dst['journeyIdentifier'])) {
-        // already there
+        // ok
     } elseif (!empty($enrichedOrOld['journeyIdentifier'])) {
         $dst['journeyIdentifier'] = $enrichedOrOld['journeyIdentifier'];
     }
 
-    // Metafelder aus aktueller Liste übernehmen (aber NICHT Details überschreiben)
-    foreach (['title','shipName','startDate','endDate','duration','routeCode','routeGroupCode','adults', 'flightIncluded'] as $k) {
+    foreach (['title','shipName','startDate','endDate','duration','routeCode','routeGroupCode','adults','flightIncluded'] as $k) {
         if (array_key_exists($k, $freshBase)) $dst[$k] = $freshBase[$k];
     }
 
-    // Link: falls fehlt, neu bauen
     if (empty($dst['absLink']) && !empty($dst['journeyIdentifier']) && !empty($dst['adults'])) {
         $dst['absLink'] = buildFindLink($dst['journeyIdentifier'], (int)$dst['adults']);
     }
-
-    // WICHTIG: Detail-Felder NIEMALS löschen/überschreiben, wenn freshBase sie gar nicht setzt.
-
     return $dst;
 }
-
 
 // Marker-Datei für täglichen Refresh (pro adults)
 function dailyMarkerFile(int $adults): string {
     return CACHE_DIR . "/aida_adults{$adults}_daily.txt";
 }
-
-// Prüft, ob heute schon ein Voll-Refresh gemacht wurde
 function shouldDailyRefresh(int $adults): bool {
     $f = dailyMarkerFile($adults);
     $today = date('Y-m-d');
     $last = is_file($f) ? trim((string)file_get_contents($f)) : '';
     return $last !== $today;
 }
-
-// Markiert, dass der heutige Voll-Refresh abgeschlossen wurde
 function setDailyRefreshed(int $adults): void {
     $f = dailyMarkerFile($adults);
     $today = date('Y-m-d');
@@ -745,6 +770,7 @@ function renderList(
             .badge{font-size:12px;padding:2px 8px;border-radius:999px;border:1px solid var(--border);background:#0e1a2d}
             .badge.ok{color:var(--down);border-color:var(--down)}
             .badge.no{color:#f39c12;border-color:#f39c12}
+            .new{margin-left:6px}
             a.link{color:var(--accent);text-decoration:none}a.link:hover{text-decoration:underline}
             .alt{color:var(--muted);font-size:12px;margin-top:4px}
             @media (max-width:768px){
@@ -765,7 +791,6 @@ function renderList(
                 · Reisen: <?php echo (int)$count; ?>
                 <?php if ($minCabin) echo ' · Mindest-Kabine: '.e(CABIN_LABELS[$minCabin] ?? $minCabin); ?>
             </div>
-
         </div>
         <div class="actions">
             <a href="<?php echo e($urlA1); ?>" class="<?php echo $adults===1?'active':''; ?>">1 Erw.</a>
@@ -827,15 +852,12 @@ function renderList(
                 $end   = $r['endDate'] ?? '';
                 $dur   = (int)($r['duration'] ?? 0);
 
-                $che   = $r['cheapest'] ?? null;
                 $alts  = $r['alternatives'] ?? [];
-
                 $flight = (bool)($r['flightIncluded'] ?? false);
 
+                // Mindest-Kabine anwenden
                 $altsFiltered = filterAlternativesByMinCabin($alts, $minCabin);
-
-                $cheFiltered = pickCheapestFromAlts($altsFiltered);
-
+                $cheFiltered  = pickCheapestFromAlts($altsFiltered);
                 if (!$cheFiltered) { continue; }
 
                 $amount = $cheFiltered['amount'] ?? null;
@@ -854,6 +876,7 @@ function renderList(
                 $altText = $altParts ? implode(' | ', $altParts) : 'keine Alternativen';
                 $cabinName = $cheFiltered['name'] ?? (CABIN_LABELS[$cheFiltered['code'] ?? ''] ?? ($cheFiltered['code'] ?? 'Kabine'));
 
+                // Deltas
                 $deltaNightStr = '';
                 if (isset($changes[$jid]) && $changes[$jid]['deltaNightPerAdult'] !== null) {
                     $d = (float)$changes[$jid]['deltaNightPerAdult'];
@@ -877,11 +900,21 @@ function renderList(
                     } else { $deltaTotalStr = '<span class="delta zero" title="keine Änderung">=</span>'; }
                 }
 
+                // 🆕 Badge (wenn added_at vorhanden & frisch)
+                $newBadge = '';
+                if (!empty($r['added_at'])) {
+                    $addedTs = strtotime($r['added_at']);
+                    if ($addedTs && (time() - $addedTs) <= NEW_BADGE_DAYS*86400) {
+                        $titleNew = 'Hinzugefügt am '.date('d.m.Y H:i:s', $addedTs).' UTC';
+                        $newBadge = '<span class="new" title="'.e($titleNew).'">🆕</span>';
+                    }
+                }
+
                 $findLink = $jid ? buildFindLink($jid, $adults) : null;
                 ?>
                 <tr>
                     <td>
-                        <div><?php echo e($title ?: $jid ?: '–'); ?></div>
+                        <div><?php echo e($title ?: $jid ?: '–'); ?> <?php echo $newBadge; ?></div>
                         <?php if ($cabinName): ?>
                             <div class="alt" title="<?php echo e($altText); ?>">
                                 <?php echo e($cabinName); ?> <span class="alt">(<?php echo e($altText); ?>)</span>
@@ -906,4 +939,86 @@ function renderList(
     <?php endif; ?>
     </body></html>
     <?php
+}
+
+/* ---------------------------- Telegram ---------------------------- */
+
+function tgSend(string $text): bool {
+    if (!TG_ENABLED) return true;
+    $token = getenv('TELEGRAM_BOT_TOKEN') ?: TELEGRAM_BOT_TOKEN;
+    $chat  = getenv('TELEGRAM_CHAT_ID')   ?: TELEGRAM_CHAT_ID;
+    if (!$token || !$chat) return false;
+
+    $url = "https://api.telegram.org/bot{$token}/sendMessage";
+    $post = http_build_query([
+            'chat_id' => $chat,
+            'text'    => $text,
+        // kein parse_mode -> plain text, robust bei Sonderzeichen
+            'disable_web_page_preview' => true,
+    ]);
+
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+            CURLOPT_POST           => true,
+            CURLOPT_POSTFIELDS     => $post,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_CONNECTTIMEOUT => 8,
+            CURLOPT_TIMEOUT        => 12,
+    ]);
+    $resp = curl_exec($ch);
+    $err  = curl_errno($ch);
+    $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    if ($err !== 0 || $code < 200 || $code >= 300) {
+        // optional: loggen
+        return false;
+    }
+    return true;
+}
+
+function formatTgMessage(array $ev, int $adults): string {
+    $r = $ev['row'] ?? [];
+    $title = (string)($r['title'] ?? ($r['journeyIdentifier'] ?? 'Reise'));
+    $ship  = (string)($r['shipName'] ?? '');
+    $start = (string)($r['startDate'] ?? '');
+    $end   = (string)($r['endDate'] ?? '');
+    $dur   = (int)($r['duration'] ?? 0);
+    $pnp   = isset($r['amountPerNightPerAdult']) ? (float)$r['amountPerNightPerAdult'] : null;
+    $amt   = isset($r['amount']) ? (float)$r['amount'] : null;
+    $link  = buildFindLink((string)$r['journeyIdentifier'], $adults);
+
+    if (($ev['type'] ?? '') === 'new') {
+        $lines = [
+                "🆕 Neue Reise",
+                $title,
+                $ship ? "Schiff: {$ship}" : null,
+                $dur ? "Nächte: {$dur}" : null,
+                ($start && $end) ? "Zeitraum: {$start} – {$end}" : null,
+                ($pnp !== null ? "ab: ".number_format($pnp,0,',','.')." ".CURRENCY."/N/Person" : null),
+                ($amt !== null ? "Gesamt: ".number_format($amt,0,',','.')." ".CURRENCY : null),
+                $link,
+        ];
+        return implode("\n", array_values(array_filter($lines, fn($x)=>$x!==null && $x!=='')));
+    }
+
+    if (($ev['type'] ?? '') === 'drop') {
+        $old  = (float)($ev['old'] ?? 0.0);
+        $new  = (float)($r['amount'] ?? 0.0);
+        $diff = $new - $old; // negativ
+        $lines = [
+                "💸 Preissenkung",
+                $title,
+                $ship ? "Schiff: {$ship}" : null,
+                $dur ? "Nächte: {$dur}" : null,
+                ($start && $end) ? "Zeitraum: {$start} – {$end}" : null,
+                "Alt: ".number_format($old,0,',','.')." ".CURRENCY,
+                "Neu: ".number_format($new,0,',','.')." ".CURRENCY." (".number_format($diff,0,',','.')." ".CURRENCY.")",
+                ($pnp !== null ? "ab: ".number_format((float)$r['amountPerNightPerAdult'],0,',','.')." ".CURRENCY."/N/Person" : null),
+                $link,
+        ];
+        return implode("\n", array_values(array_filter($lines, fn($x)=>$x!==null && $x!=='')));
+    }
+
+    // Fallback
+    return $title."\n".$link;
 }
