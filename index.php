@@ -34,6 +34,7 @@ define('SIZE_PER_PAGE',   (int)cfg('SIZE_PER_PAGE',   1000));
 define('USER_AGENT',      (string)cfg('USER_AGENT',    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124 Safari/537.36'));
 define('CURRENCY',        (string)cfg('CURRENCY',      '€'));
 define('NEW_BADGE_DAYS',  (int)cfg('NEW_BADGE_DAYS',   3));
+define('DAILY_FULL_SCAN',  (int)cfg('DAILY_FULL_SCAN',   true));
 
 if (!is_dir(CACHE_DIR)) { @mkdir(CACHE_DIR, 0775, true); }
 $cookieFile = CACHE_DIR . '/aida_cookies.txt';
@@ -96,7 +97,7 @@ if (php_sapi_name() === 'cli') {
         }
 
         // Daily-Flag
-        $daily = shouldDailyRefresh($cliAdults);
+        $daily = shouldDailyRefresh($cliAdults) && DAILY_FULL_SCAN;
         if ($daily) logStatus("Täglicher Detail-Refresh ist fällig (letzter vor mehr als 24 h).");
 
         // Entscheiden, für welche Journeys die Detail-API nötig ist (Vergleich nur über listAmount des Hauptcaches)

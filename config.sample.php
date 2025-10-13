@@ -26,6 +26,9 @@ return [
     // Wie lange Reisen als "neu" (🆕) markiert werden (in Tagen)
     'NEW_BADGE_DAYS'  => 3,
 
+    // Täglicher Vollscan (aller Kabinen Details)
+    'DAILY_FULL_SCAN'  => false,
+
     // Telegram-Bot (optional, sonst keine Benachrichtigungen)
     'TELEGRAM_ENABLED' => false,
     'TELEGRAM_BOT_TOKEN' => '',
